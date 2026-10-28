@@ -106,6 +106,21 @@ router.route('/')
  *     responses:
  *       200:
  *         description: تم التحديث بنجاح
+ *   delete:
+ *     summary: حذف عامل (حذف ذكي)
+ *     description: يحذف العامل نهائياً إذا لم يكن مرتبطاً بفواتير. وإذا كان مرتبطاً، يقوم بحذفه مرنياً (Soft Delete) لإخفائه دون تدمير الفواتير القديمة.
+ *     tags: [Workers]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: تم الحذف بنجاح (سواء نهائي أو مرن)
  */
 router.route('/:id')
   .get(workerController.getWorkerById)
@@ -113,6 +128,10 @@ router.route('/:id')
     authorize('Admin', 'InventoryAccountant', 'GeneralAccountant'),
     validateRequest(updateWorkerSchema),
     workerController.updateWorker
+  )
+  .delete(
+    authorize('Admin', 'InventoryAccountant', 'GeneralAccountant'),
+    workerController.deleteWorker
   );
 
 /**

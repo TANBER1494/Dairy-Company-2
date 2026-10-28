@@ -43,10 +43,19 @@ const toggleProductStatus = asyncHandler(async (req, res, next) => {
   });
 });
 
+const deleteProduct = asyncHandler(async (req, res, next) => {
+  const result = await productService.deleteProduct(req.params.id);
+  res.status(200).json({
+    message: result.message,
+    delete_type: result.type
+  });
+});
+
 module.exports = {
   createProduct,
   getAllProducts,
   getProductById,
   updateProduct,
-  toggleProductStatus
+  toggleProductStatus,
+  deleteProduct
 };

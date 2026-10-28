@@ -7,6 +7,7 @@ const Product = require('../models/Product');
 const DailyReport = require('../models/DailyReport');
 const Notification = require('../models/Notification');
 const socket = require('../models/socket');
+const { getCurrentShift } = require('../utils/timeUtils');
 
 class DashboardService {
   _getLocalDateString(date) {
@@ -174,18 +175,18 @@ class DashboardService {
     return savedReport;
   }
 
-async triggerShiftNotification() {
-    const currentHour = parseInt(new Date().toLocaleString("en-US", {timeZone: "Africa/Cairo", hour: '2-digit', hour12: false}));
+  async triggerShiftNotification() {
+    const currentShift = getCurrentShift();
     
-    const isAfternoon = currentHour >= 14 && currentHour <= 17;
-    const endedShiftArabic = isAfternoon ? 'الوردية الصباحية' : 'الوردية المسائية';
-    const startedShiftArabic = isAfternoon ? 'الوردية المسائية' : 'الوردية الصباحية';
-    const shiftCode = isAfternoon ? 'MORNING' : 'EVENING';
+    const isMorningNow = currentShift === 'MORNING';
+    const endedShiftArabic = isMorningNow ? 'الوردية المسائية' : 'الوردية الصباحية';
+    const startedShiftArabic = isMorningNow ? 'الوردية الصباحية' : 'الوردية المسائية';
+    const shiftCodeForReport = isMorningNow ? 'EVENING' : 'MORNING';
 
     const workingDate = new Date();
     workingDate.setHours(workingDate.getHours() - 4);
 
-    const reportData = await this.calculateLiveDailyReport(workingDate, shiftCode);
+    const reportData = await this.calculateLiveDailyReport(workingDate, shiftCodeForReport);
     const suppliedCount = reportData.suppliedCount || 0;
     const pendingCount = reportData.pendingCount || 0;
 

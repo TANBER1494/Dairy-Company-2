@@ -1,13 +1,17 @@
+const mongoose = require('mongoose');
 const Client = require('../models/Client');
 const AppError = require('../utils/AppError');
 const ClientTransaction = require('../models/ClientTransaction');
+const { getCurrentShift } = require('../utils/timeUtils');
 
 class ClientService {
   async createClient(data) {
     const existingClient = await Client.findOne({ code: data.code });
     if (existingClient) throw new AppError('كود العميل مسجل بالفعل', 400);
-    data.current_balance = 0; 
-    return await Client.create(data);
+    
+    const { current_balance, ...clientData } = data;
+    clientData.current_balance = 0; 
+    return await Client.create(clientData);
   }
 
   async getAllClients(query = {}) {
@@ -32,8 +36,9 @@ class ClientService {
       const existingClient = await Client.findOne({ code: data.code, _id: { $ne: id } });
       if (existingClient) throw new AppError('كود العميل مستخدم لعميل آخر', 400);
     }
-    delete data.current_balance;
-    const client = await Client.findByIdAndUpdate(id, data, { new: true, runValidators: true });
+    
+    const { current_balance, ...clientData } = data;
+    const client = await Client.findByIdAndUpdate(id, clientData, { new: true, runValidators: true });
     if (!client) throw new AppError('العميل غير موجود', 404);
     return client;
   }
@@ -83,40 +88,56 @@ class ClientService {
   }
 
   async settleAccount(id, payload, userId) {
-    const client = await Client.findById(id);
-    if (!client) throw new AppError('العميل غير موجود', 404);
+    const session = await mongoose.startSession();
+    session.startTransaction();
 
-    const totalAmountFromFrontend = Number(payload.total_amount) || 0; 
-    const paidNow = Number(payload.paid_amount) || 0; 
+    try {
+      const client = await Client.findById(id).session(session);
+      if (!client) throw new AppError('العميل غير موجود', 404);
 
-    let missingMilkValue = totalAmountFromFrontend - client.current_balance;
-    if (missingMilkValue < 0) missingMilkValue = 0; 
+      const unsettledTxs = await ClientTransaction.find({ client_id: id, is_settled: false }).select('_id').session(session);
+      const unsettledIds = unsettledTxs.map(tx => tx._id);
 
-    client.current_balance = totalAmountFromFrontend - paidNow;
-    await client.save();
+      const totalAmountFromFrontend = Number(payload.total_amount) || 0; 
+      const paidNow = Number(payload.paid_amount) || 0; 
 
-    await ClientTransaction.updateMany(
-      { client_id: id, is_settled: false },
-      { $set: { is_settled: true } }
-    );
+      let missingMilkValue = totalAmountFromFrontend - client.current_balance;
+      if (missingMilkValue < 0) missingMilkValue = 0; 
 
-    const currentHour = parseInt(new Date().toLocaleString("en-US", {timeZone: "Africa/Cairo", hour: '2-digit', hour12: false}));
-    const currentShift = (currentHour >= 4 && currentHour < 16) ? 'MORNING' : 'EVENING';
+      client.current_balance = totalAmountFromFrontend - paidNow;
+      await client.save({ session });
 
-    await ClientTransaction.create({
-      client_id: id,
-      quantity: 0,
-      unit_price: 0,
-      total_price: missingMilkValue, 
-      paid_amount: paidNow, 
-      shift: currentShift,
-      balance_after: client.current_balance,
-      is_settled: true,
-      notes: "تسوية وقفل دفتر",
-      created_by: userId
-    });
+      if (unsettledIds.length > 0) {
+        await ClientTransaction.updateMany(
+          { _id: { $in: unsettledIds } },
+          { $set: { is_settled: true } },
+          { session }
+        );
+      }
 
-    return client;
+      const currentShift = getCurrentShift();
+
+      await ClientTransaction.create([{
+        client_id: id,
+        quantity: 0,
+        unit_price: 0,
+        total_price: missingMilkValue, 
+        paid_amount: paidNow, 
+        shift: currentShift,
+        balance_after: client.current_balance,
+        is_settled: true,
+        notes: "تسوية وقفل دفتر",
+        created_by: userId
+      }], { session });
+
+      await session.commitTransaction();
+      return client;
+    } catch (error) {
+      await session.abortTransaction();
+      throw error;
+    } finally {
+      session.endSession();
+    }
   }
 }
 

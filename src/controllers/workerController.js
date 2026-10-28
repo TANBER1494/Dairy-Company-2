@@ -27,4 +27,12 @@ const toggleWorkerStatus = asyncHandler(async (req, res) => {
   res.status(200).json({ message: `تم ${worker.is_active ? 'تنشيط' : 'إيقاف'} العامل بنجاح`, data: worker });
 });
 
-module.exports = { createWorker, getAllWorkers, getWorkerById, updateWorker, toggleWorkerStatus };
+const deleteWorker = asyncHandler(async (req, res) => {
+  const result = await workerService.deleteWorker(req.params.id);
+  res.status(200).json({ 
+    message: result.message,
+    delete_type: result.type
+  });
+});
+
+module.exports = { createWorker, getAllWorkers, getWorkerById, updateWorker, toggleWorkerStatus, deleteWorker };

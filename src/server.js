@@ -7,6 +7,7 @@ const mongoSanitize = require('express-mongo-sanitize');
 const hpp = require('hpp');
 const compression = require('compression');
 const rateLimit = require('express-rate-limit');
+//const xss = require('xss-clean');
 const http = require('http');
 
 const logger = require('./utils/logger');
@@ -89,7 +90,14 @@ if (process.env.DISABLE_RATE_LIMIT !== 'true') {
 // Body Parsing & Data Sanitization
 app.use(express.json({ limit: '100kb' }));
 app.use(express.urlencoded({ extended: true, limit: '100kb' }));
-//app.use(mongoSanitize());
+// Data Sanitization Custom Middleware
+app.use((req, res, next) => {
+  mongoSanitize.sanitize(req.body, { replaceWith: '_' });
+  mongoSanitize.sanitize(req.query, { replaceWith: '_' });
+  mongoSanitize.sanitize(req.params, { replaceWith: '_' });
+  next();
+});
+//app.use(xss());
 app.use(hpp());
 
 const morganFormat = process.env.NODE_ENV === 'production' ? 'combined' : 'dev';

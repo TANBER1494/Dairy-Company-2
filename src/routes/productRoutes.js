@@ -115,6 +115,21 @@ router
  *     responses:
  *       200:
  *         description: تم التحديث بنجاح
+ *   delete:
+ *     summary: حذف منتج (حذف ذكي)
+ *     description: يحذف المنتج نهائياً إذا لم يكن مرتبطاً بفواتير. وإذا كان مرتبطاً، يقوم بحذفه مرنياً (Soft Delete) لإخفائه دون تدمير الفواتير القديمة.
+ *     tags: [Products]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: تم الحذف بنجاح (سواء نهائي أو مرن)
  */
 router
   .route('/:id')
@@ -123,6 +138,10 @@ router
     authorize('Admin', 'InventoryAccountant'),
     validateRequest(updateProductSchema),
     productController.updateProduct
+  )
+  .delete(
+    authorize('Admin'),
+    productController.deleteProduct
   );
 
 /**

@@ -9,8 +9,6 @@ const productSchema = new mongoose.Schema(
     code: {
       type: Number,
       required: [true, 'Product code is required'],
-      unique: true,
-      index: true,
     },
     name: {
       type: String,
@@ -31,8 +29,17 @@ const productSchema = new mongoose.Schema(
       type: Boolean,
       default: true,
     },
+    deleted_at: {
+      type: Date,
+      default: null,
+    }
   },
   { timestamps: true }
+);
+
+productSchema.index(
+  { code: 1 }, 
+  { unique: true, partialFilterExpression: { deleted_at: null } }
 );
 
 module.exports = mongoose.model('Product', productSchema);

@@ -1,54 +1,73 @@
+const mongoose = require('mongoose');
 const ClientTransaction = require('../models/ClientTransaction');
 const Client = require('../models/Client');
 const Product = require('../models/Product');
 const AppError = require('../utils/AppError');
+const { getCurrentShift } = require('../utils/timeUtils');
 
 class ClientTransactionService {
   async createTransaction(data, userId) {
     const { client_id, worker_id, product_id, quantity, unit_price, paid_amount, shift, notes, date } = data;
+    const MAX_RETRIES = 3;
 
-    const client = await Client.findById(client_id);
-    if (!client) throw new AppError('العميل غير موجود', 404);
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      const session = await mongoose.startSession();
+      session.startTransaction();
 
-    const qty = Number(quantity) || 0;
-    const price = Number(unit_price) || 0;
-    const paid = Number(paid_amount) || 0;
-    const total_price = qty * price;
+      try {
+        const client = await Client.findById(client_id).session(session);
+        if (!client) throw new AppError('العميل غير موجود', 404);
 
-    if (qty > 0 && product_id) {
-      const product = await Product.findById(product_id);
-      if (!product) throw new AppError('المنتج غير موجود', 404);
+        const qty = Number(quantity) || 0;
+        const price = Number(unit_price) || 0;
+        const paid = Number(paid_amount) || 0;
+        const total_price = qty * price;
 
-      if (product.current_stock < qty) {
-        throw new AppError(`عفواً، رصيد المخزن لا يكفي. المتاح: ${product.current_stock}، والمطلوب: ${qty}`, 400);
+        if (qty > 0 && product_id) {
+          const product = await Product.findOneAndUpdate(
+            { _id: product_id, current_stock: { $gte: qty } },
+            { $inc: { current_stock: -qty } },
+            { new: true, session }
+          );
+
+          if (!product) {
+            throw new AppError(`عفواً، رصيد المخزن لا يكفي أو المنتج غير موجود. الكمية المطلوبة: ${qty}`, 400);
+          }
+        }
+
+        const autoShift = getCurrentShift();
+        const finalShift = shift || autoShift;
+
+        const transaction = await ClientTransaction.create([{
+          client_id,
+          worker_id: worker_id || null,
+          product_id: product_id || null,
+          quantity: qty,
+          unit_price: price,
+          total_price,
+          paid_amount: paid,
+          balance_after: client.current_balance,
+          shift: finalShift,
+          notes,
+          date: date || Date.now(),
+          created_by: userId
+        }], { session });
+
+        await session.commitTransaction();
+        return transaction[0];
+      } catch (error) {
+        await session.abortTransaction();
+        
+        if (error.hasErrorLabel && error.hasErrorLabel('TransientTransactionError') && attempt < MAX_RETRIES) {
+          console.warn(`⚠️ Write conflict detected on POST Client Transaction. Retrying attempt ${attempt}...`);
+          continue; 
+        }
+        
+        throw error;
+      } finally {
+        session.endSession();
       }
-
-      await Product.findByIdAndUpdate(product_id, {
-        $inc: { current_stock: -qty }
-      });
     }
-
-    const currentHour = parseInt(new Date().toLocaleString("en-US", {timeZone: "Africa/Cairo", hour: '2-digit', hour12: false}));
-    const autoShift = (currentHour >= 4 && currentHour < 16) ? 'MORNING' : 'EVENING';
-    
-    const finalShift = shift || autoShift;
-
-    const transaction = await ClientTransaction.create({
-      client_id,
-      worker_id: worker_id || null,
-      product_id: product_id || null,
-      quantity: qty,
-      unit_price: price,
-      total_price,
-      paid_amount: paid,
-      balance_after: client.current_balance,
-      shift: finalShift,
-      notes,
-      date: date || Date.now(),
-      created_by: userId
-    });
-
-    return transaction;
   }
 
   async getAllTransactions(query = {}, page = 1, limit = 50) {
@@ -80,65 +99,101 @@ class ClientTransactionService {
   }
 
   async updateTransaction(id, data, userId) {
-    const oldTx = await ClientTransaction.findById(id);
-    if (!oldTx) throw new AppError('الفاتورة غير موجودة', 404);
-    if (oldTx.is_settled) throw new AppError('لا يمكن تعديل فاتورة تم تصفية حسابها', 400);
+    const MAX_RETRIES = 3;
 
-    const newProductId = data.product_id !== undefined ? data.product_id : oldTx.product_id;
-    const qty = data.quantity !== undefined ? Number(data.quantity) : oldTx.quantity;
-    const price = data.unit_price !== undefined ? Number(data.unit_price) : oldTx.unit_price;
-    const paid = data.paid_amount !== undefined ? Number(data.paid_amount) : oldTx.paid_amount;
-    const total_price = qty * price;
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      const session = await mongoose.startSession();
+      session.startTransaction();
 
-    if (qty > 0 && newProductId) {
-      const product = await Product.findById(newProductId);
-      if (!product) throw new AppError('المنتج غير موجود', 404);
+      try {
+        const oldTx = await ClientTransaction.findById(id).session(session);
+        if (!oldTx) throw new AppError('الفاتورة غير موجودة', 404);
+        if (oldTx.is_settled) throw new AppError('لا يمكن تعديل فاتورة تم تصفية حسابها', 400);
 
-      let availableStock = product.current_stock;
+        const newProductId = data.product_id !== undefined ? data.product_id : oldTx.product_id;
+        const qty = data.quantity !== undefined ? Number(data.quantity) : oldTx.quantity;
+        const price = data.unit_price !== undefined ? Number(data.unit_price) : oldTx.unit_price;
+        const paid = data.paid_amount !== undefined ? Number(data.paid_amount) : oldTx.paid_amount;
+        const total_price = qty * price;
 
-      if (oldTx.product_id && oldTx.product_id.toString() === newProductId.toString()) {
-        availableStock += oldTx.quantity;
+        if (oldTx.product_id && oldTx.quantity > 0) {
+          await Product.findByIdAndUpdate(
+            oldTx.product_id, 
+            { $inc: { current_stock: oldTx.quantity } }, 
+            { session, new: true }
+          );
+        }
+
+        if (qty > 0 && newProductId) {
+          const product = await Product.findOneAndUpdate(
+            { _id: newProductId, current_stock: { $gte: qty } },
+            { $inc: { current_stock: -qty } },
+            { session, new: true }
+          );
+
+          if (!product) {
+            throw new AppError(`عفواً، رصيد المخزن لا يكفي لتعديل الفاتورة.`, 400);
+          }
+        }
+
+        const updatedTx = await ClientTransaction.findByIdAndUpdate(id, {
+          ...data,
+          total_price,
+          updated_by: userId
+        }, { new: true, runValidators: true, session });
+
+        await session.commitTransaction();
+        return updatedTx;
+      } catch (error) {
+        await session.abortTransaction();
+        
+        if (error.hasErrorLabel && error.hasErrorLabel('TransientTransactionError') && attempt < MAX_RETRIES) {
+          continue;
+        }
+        
+        throw error;
+      } finally {
+        session.endSession();
       }
-
-      if (availableStock < qty) {
-        throw new AppError(`عفواً، رصيد المخزن لا يكفي لتعديل الفاتورة. أقصى كمية متاحة لك هي: ${availableStock}`, 400);
-      }
     }
-
-    if (oldTx.product_id && oldTx.quantity > 0) {
-      await Product.findByIdAndUpdate(oldTx.product_id, {
-        $inc: { current_stock: oldTx.quantity }
-      });
-    }
-
-    if (qty > 0 && newProductId) {
-      await Product.findByIdAndUpdate(newProductId, {
-        $inc: { current_stock: -qty }
-      });
-    }
-
-    const updatedTx = await ClientTransaction.findByIdAndUpdate(id, {
-      ...data,
-      total_price,
-      updated_by: userId
-    }, { new: true, runValidators: true });
-
-    return updatedTx;
   }
 
   async deleteTransaction(id) {
-    const tx = await ClientTransaction.findById(id);
-    if (!tx) throw new AppError('الفاتورة غير موجودة', 404);
-    if (tx.is_settled) throw new AppError('لا يمكن حذف فاتورة تم تصفية حسابها', 400);
+    const MAX_RETRIES = 3;
 
-    if (tx.product_id && tx.quantity > 0) {
-      await Product.findByIdAndUpdate(tx.product_id, {
-        $inc: { current_stock: tx.quantity }
-      });
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      const session = await mongoose.startSession();
+      session.startTransaction();
+
+      try {
+        const tx = await ClientTransaction.findById(id).session(session);
+        if (!tx) throw new AppError('الفاتورة غير موجودة', 404);
+        if (tx.is_settled) throw new AppError('لا يمكن حذف فاتورة تم تصفية حسابها', 400);
+
+        if (tx.product_id && tx.quantity > 0) {
+          await Product.findByIdAndUpdate(
+            tx.product_id, 
+            { $inc: { current_stock: tx.quantity } }, 
+            { session, new: true }
+          );
+        }
+
+        await tx.deleteOne({ session });
+        
+        await session.commitTransaction();
+        return true;
+      } catch (error) {
+        await session.abortTransaction();
+        
+        if (error.hasErrorLabel && error.hasErrorLabel('TransientTransactionError') && attempt < MAX_RETRIES) {
+          continue;
+        }
+        
+        throw error;
+      } finally {
+        session.endSession();
+      }
     }
-
-    await tx.deleteOne();
-    return true;
   }
 
   async bulkCreateTransactions(transactionsData, userId) {

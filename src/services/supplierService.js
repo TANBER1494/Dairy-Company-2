@@ -1,6 +1,8 @@
+const mongoose = require('mongoose');
 const Supplier = require('../models/Supplier');
 const AppError = require('../utils/AppError');
 const SupplierTransaction = require('../models/SupplierTransaction');
+const { getCurrentShift } = require('../utils/timeUtils');
 
 class SupplierService {
   async createSupplier(data) {
@@ -8,8 +10,10 @@ class SupplierService {
     if (existingSupplier) {
       throw new AppError('كود المورد مسجل بالفعل', 400);
     }
-    data.current_balance = 0; 
-    return await Supplier.create(data);
+    
+    const { current_balance, ...supplierData } = data;
+    supplierData.current_balance = 0; 
+    return await Supplier.create(supplierData);
   }
 
   async getAllSuppliers(query = {}) {
@@ -34,8 +38,9 @@ class SupplierService {
       const existingSupplier = await Supplier.findOne({ code: data.code, _id: { $ne: id } });
       if (existingSupplier) throw new AppError('كود المورد مستخدم لمورد آخر', 400);
     }
-    delete data.current_balance;
-    const supplier = await Supplier.findByIdAndUpdate(id, data, { new: true, runValidators: true });
+    
+    const { current_balance, ...supplierData } = data;
+    const supplier = await Supplier.findByIdAndUpdate(id, supplierData, { new: true, runValidators: true });
     if (!supplier) throw new AppError('المورد غير موجود', 404);
     return supplier;
   }
@@ -85,40 +90,56 @@ class SupplierService {
   }
 
   async settleAccount(id, payload, userId) {
-    const supplier = await Supplier.findById(id);
-    if (!supplier) throw new AppError('المورد غير موجود', 404);
+    const session = await mongoose.startSession();
+    session.startTransaction();
 
-    const totalAmountFromFrontend = Number(payload.total_amount) || 0; 
-    const paidNow = Number(payload.paid_amount) || 0; 
+    try {
+      const supplier = await Supplier.findById(id).session(session);
+      if (!supplier) throw new AppError('المورد غير موجود', 404);
 
-    let missingMilkValue = totalAmountFromFrontend - supplier.current_balance;
-    if (missingMilkValue < 0) missingMilkValue = 0; 
+      const unsettledTxs = await SupplierTransaction.find({ supplier_id: id, is_settled: false }).select('_id').session(session);
+      const unsettledIds = unsettledTxs.map(tx => tx._id);
 
-    supplier.current_balance = totalAmountFromFrontend - paidNow;
-    await supplier.save();
+      const totalAmountFromFrontend = Number(payload.total_amount) || 0; 
+      const paidNow = Number(payload.paid_amount) || 0; 
 
-    await SupplierTransaction.updateMany(
-      { supplier_id: id, is_settled: false },
-      { $set: { is_settled: true } }
-    );
+      let missingMilkValue = totalAmountFromFrontend - supplier.current_balance;
+      if (missingMilkValue < 0) missingMilkValue = 0; 
 
-    const currentHour = parseInt(new Date().toLocaleString("en-US", {timeZone: "Africa/Cairo", hour: '2-digit', hour12: false}));
-    const currentShift = (currentHour >= 4 && currentHour < 16) ? 'MORNING' : 'EVENING';
+      supplier.current_balance = totalAmountFromFrontend - paidNow;
+      await supplier.save({ session });
 
-    await SupplierTransaction.create({
-      supplier_id: id,
-      quantity: 0, 
-      unit_price: 0,
-      total_price: missingMilkValue, 
-      paid_amount: paidNow,          
-      shift: currentShift,
-      balance_after: supplier.current_balance,
-      is_settled: true,   
-      notes: "تسوية وقفل دفتر",
-      created_by: userId
-    });
+      if (unsettledIds.length > 0) {
+        await SupplierTransaction.updateMany(
+          { _id: { $in: unsettledIds } },
+          { $set: { is_settled: true } },
+          { session }
+        );
+      }
 
-    return supplier;
+      const currentShift = getCurrentShift();
+
+      await SupplierTransaction.create([{
+        supplier_id: id,
+        quantity: 0, 
+        unit_price: 0,
+        total_price: missingMilkValue, 
+        paid_amount: paidNow,          
+        shift: currentShift,
+        balance_after: supplier.current_balance,
+        is_settled: true,   
+        notes: "تسوية وقفل دفتر",
+        created_by: userId
+      }], { session });
+
+      await session.commitTransaction();
+      return supplier;
+    } catch (error) {
+      await session.abortTransaction();
+      throw error;
+    } finally {
+      session.endSession();
+    }
   }
 }
 
