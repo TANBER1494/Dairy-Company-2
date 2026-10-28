@@ -1,0 +1,157 @@
+const SupplierTransaction = require('../models/SupplierTransaction');
+const Supplier = require('../models/Supplier');
+const Product = require('../models/Product');
+const AppError = require('../utils/AppError');
+
+class SupplierTransactionService {
+  async createTransaction(data, userId) {
+    const { supplier_id, worker_id, product_id, quantity, unit_price, paid_amount, shift, notes, date } = data;
+
+    const supplier = await Supplier.findById(supplier_id);
+    if (!supplier) throw new AppError('المورد غير موجود', 404);
+
+    const qty = Number(quantity) || 0;
+    const price = Number(unit_price) || 0;
+    const paid = Number(paid_amount) || 0;
+    const total_price = qty * price;
+
+    if (qty > 0 && product_id) {
+      await Product.findByIdAndUpdate(product_id, {
+        $inc: { current_stock: qty }
+      });
+    }
+
+    const currentHour = parseInt(new Date().toLocaleString("en-US", {timeZone: "Africa/Cairo", hour: '2-digit', hour12: false}));
+    const autoShift = (currentHour >= 4 && currentHour < 16) ? 'MORNING' : 'EVENING';
+    
+    const finalShift = shift || autoShift;
+
+    const transaction = await SupplierTransaction.create({
+      supplier_id,
+      worker_id: worker_id || null,
+      product_id: product_id || null,
+      quantity: qty,
+      unit_price: price,
+      total_price,
+      paid_amount: paid,
+      balance_after: supplier.current_balance, 
+      shift: finalShift,
+      notes,
+      date: date || Date.now(),
+      created_by: userId
+    });
+
+    return transaction;
+  }
+
+  async getAllTransactions(query = {}, page = 1, limit = 50) {
+    const skip = (page - 1) * limit;
+
+    const [transactions, totalItems] = await Promise.all([
+      SupplierTransaction.find(query)
+        .populate('supplier_id', 'name code')
+        .populate('worker_id', 'name')
+        .populate('product_id', 'name')
+        .populate('created_by', 'name')
+        .populate('updated_by', 'name') 
+        .sort({ date: -1, createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .lean(),
+      SupplierTransaction.countDocuments(query)
+    ]);
+
+    return {
+      transactions,
+      pagination: {
+        currentPage: page,
+        totalPages: Math.ceil(totalItems / limit),
+        totalItems,
+        limit
+      }
+    };
+  }
+
+  async updateTransaction(id, data, userId) {
+    const oldTx = await SupplierTransaction.findById(id);
+    if (!oldTx) throw new AppError('الفاتورة غير موجودة', 404);
+    if (oldTx.is_settled) throw new AppError('لا يمكن تعديل فاتورة تم تصفية حسابها', 400);
+
+    const newProductId = data.product_id !== undefined ? data.product_id : oldTx.product_id;
+    const qty = data.quantity !== undefined ? Number(data.quantity) : oldTx.quantity;
+    const price = data.unit_price !== undefined ? Number(data.unit_price) : oldTx.unit_price;
+    const paid = data.paid_amount !== undefined ? Number(data.paid_amount) : oldTx.paid_amount;
+    const total_price = qty * price;
+
+    if (oldTx.product_id && oldTx.quantity > 0) {
+      const oldProduct = await Product.findById(oldTx.product_id);
+      if (!oldProduct) throw new AppError('المنتج المرتبط بهذه الفاتورة غير موجود', 404);
+
+      if (newProductId && newProductId.toString() === oldTx.product_id.toString()) {
+        if (qty < oldTx.quantity) {
+          const deduction = oldTx.quantity - qty; // الكمية التي سيتم سحبها من المخزن
+          if (oldProduct.current_stock < deduction) {
+            throw new AppError(`لا يمكن تقليل كمية الفاتورة. تم بيع جزء من هذا التوريد، وأقصى كمية يمكن خصمها من المخزن حالياً هي: ${oldProduct.current_stock}`, 400);
+          }
+        }
+      } else {
+        if (oldProduct.current_stock < oldTx.quantity) {
+          throw new AppError(`لا يمكن تغيير المنتج. تم بيع جزء من التوريد القديم، ورصيد المخزن الحالي (${oldProduct.current_stock}) لا يغطي الكمية المراد سحبها (${oldTx.quantity})`, 400);
+        }
+      }
+    }
+
+    if (oldTx.product_id && oldTx.quantity > 0) {
+      await Product.findByIdAndUpdate(oldTx.product_id, {
+        $inc: { current_stock: -oldTx.quantity }
+      });
+    }
+
+    if (qty > 0 && newProductId) {
+      await Product.findByIdAndUpdate(newProductId, {
+        $inc: { current_stock: qty }
+      });
+    }
+
+    const updatedTx = await SupplierTransaction.findByIdAndUpdate(id, {
+      ...data,
+      total_price,
+      updated_by: userId
+    }, { new: true, runValidators: true });
+
+    return updatedTx;
+  }
+
+  async deleteTransaction(id) {
+    const tx = await SupplierTransaction.findById(id);
+    if (!tx) throw new AppError('الفاتورة غير موجودة', 404);
+    if (tx.is_settled) throw new AppError('لا يمكن حذف فاتورة تم تصفية حسابها', 400);
+
+    if (tx.product_id && tx.quantity > 0) {
+      const product = await Product.findById(tx.product_id);
+      if (!product) throw new AppError('المنتج المرتبط بهذه الفاتورة غير موجود', 404);
+
+      if (product.current_stock < tx.quantity) {
+        throw new AppError(`لا يمكن حذف هذه الفاتورة. تم بيع جزء من التوريد للعملاء، ورصيد المخزن الحالي (${product.current_stock}) أقل من كمية الفاتورة (${tx.quantity}).`, 400);
+      }
+
+      await Product.findByIdAndUpdate(tx.product_id, {
+        $inc: { current_stock: -tx.quantity }
+      });
+    }
+
+    await tx.deleteOne();
+    return true;
+  }
+
+  async bulkCreateTransactions(transactionsData, userId) {
+    const results = [];
+    for (const data of transactionsData) {
+      const tx = await this.createTransaction(data, userId);
+      results.push(tx);
+    }
+    return results;
+  }
+}
+
+module.exports = new SupplierTransactionService();
