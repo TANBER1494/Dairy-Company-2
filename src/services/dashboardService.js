@@ -40,12 +40,24 @@ class DashboardService {
 
     const clientsData = await ClientTransaction.aggregate([
       { $match: matchStage },
-      { $group: { _id: null, totalPaid: { $sum: '$paid_amount' }, totalSales: { $sum: '$total_price' } } }
+      { $group: { 
+          _id: null, 
+          totalPaid: { $sum: '$paid_amount' }, 
+          totalSales: { $sum: '$total_price' },
+          totalQuantity: { $sum: '$quantity' } 
+        } 
+      }
     ]);
 
     const suppliersData = await SupplierTransaction.aggregate([
       { $match: matchStage },
-      { $group: { _id: null, totalPaid: { $sum: '$paid_amount' }, totalPurchases: { $sum: '$total_price' } } }
+      { $group: { 
+          _id: null, 
+          totalPaid: { $sum: '$paid_amount' }, 
+          totalPurchases: { $sum: '$total_price' },
+          totalQuantity: { $sum: '$quantity' } 
+        } 
+      }
     ]);
 
     const expensesData = await Expense.aggregate([
@@ -55,9 +67,11 @@ class DashboardService {
 
     const totalClientPayments = clientsData[0]?.totalPaid || 0;
     const totalSales = clientsData[0]?.totalSales || 0;
+    const totalClientQuantity = clientsData[0]?.totalQuantity || 0; 
     
     const totalSupplierPayments = suppliersData[0]?.totalPaid || 0;
     const totalPurchases = suppliersData[0]?.totalPurchases || 0;
+    const totalSupplierQuantity = suppliersData[0]?.totalQuantity || 0; 
     
     const totalExpenses = expensesData[0]?.total || 0;
 
@@ -81,6 +95,10 @@ class DashboardService {
         totalClientPayments,
         totalSupplierPayments,
         netCashFlow
+      },
+      quantities: {
+        totalReceivedMilk: totalSupplierQuantity, 
+        totalSoldMilk: totalClientQuantity 
       },
       balances: {
         totalDebtsToSuppliers: totalSupplierDebts[0]?.total || 0,
